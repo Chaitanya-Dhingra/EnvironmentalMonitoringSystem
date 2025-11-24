@@ -7,7 +7,7 @@
 
 
 const int mq2analog = 32 ; // A0 of mq2 is used 
-const int mq135analog = 34 ;    // A0 of mq135 is used
+const int miscellaneous_gases = 34 ;    // A0 of mq135 is used
 // cretaing bmp sensor object: avoids confusio during use of multiple Adafruit sensors 
 Adafruit_BMP085_Unified bmp = Adafruit_BMP085_Unified(100);     // any arbitrary number can be there in place of 100,
                                                             //  it's just to differentiate different adafruit sensors 
@@ -15,59 +15,60 @@ Adafruit_BMP085_Unified bmp = Adafruit_BMP085_Unified(100);     // any arbitrary
 #define DHTPIN 33       
 #define DHTTYPE DHT11   // informs library which sensor we are using
 #define pm_led 12          // 12,15 are strapping pin 
-#define pm_vo 15         // reads analog voltage from pm sensor 
+#define pm_vo 35         // reads analog voltage from pm sensor 
 
 DHT dht(DHTPIN , DHTTYPE);       // dht object is formed 
 
 
 const  char* ssid ="2x9";
 const  char* password = "geeu2025-26";
-unsigned long channel_id = 3150540;
-const  char* write_api = "ECNQVPZTGWSYMRRT";
+unsigned long channel_id = 3160929;
+const  char* write_api = "D00EZGQ59RTMHZVT";
 WiFiClient Client;
-void setup()
+
+// checking whether data is sent to cloud or not 
+void data_cloud( int retry)
 {
-  Serial.begin(115200);
-
-  // esp32 wifi stuff
-  WiFi.begin(ssid , password);
-  if ( WiFi.status() != WL_CONNECTED)
+  int status = ThingSpeak.writeFields(channel_id , write_api);
+  if (status ==200)         // 200 is HTTP code for "OK"
   {
-    Serial.println("Connecting to Wifi.........");
-    delay(100);
+    Serial.println("All The readings Sent to Cloud");
+  }
+  else if (retry>0)
+  {
+    Serial.println("Retrying..");
+    delay(5000);  //Avoids Hammering ThingSpeak, 5 seconds gives ESP32 time to stabilize , Prevents Stack Overflow
+    data_cloud(retry -1 );
   }
 
-  Serial.println("Wifi Connected ");
-  ThingSpeak.begin(Client);
-
-  // other stuffs
-  pinMode(mq2analog,INPUT);      // mq2 pin initiated for taking input 
-  pinMode(mq135analog , INPUT);     // MQ135 PIN IS INITIATED FOR TAKING INPUT
-  pinMode(pm_led , OUTPUT);              // led has to glow 
-  pinMode(pm_vo , INPUT);
-
-  Wire.begin(21,22);    // initialises i2c communication for SDA , SCK
-
-  // initialising bmp sensor 
-  if (!bmp.begin())
+  else 
   {
-    Serial.println("BMP is not working ");
-    return ;
+    Serial.println("Data not sent to cloud ");
   }
-  Serial.println("==================================");
 }
 
-void loop()
+void mq2_read()
 {
-  Serial.println("\n==== Environmental Snapshot ====");
-
   // mq2 code - carbon monoxide 
   int mq2_read = analogRead(mq2analog);
   ThingSpeak.setField( 5,mq2_read);
 
   float mq2_per = (mq2_read/4095.0)*100.0;
   Serial.printf("CO : %0.2f %% \t\n",mq2_per);
+}
 
+void miscellaneous_gases_read()
+{
+  // mq135 code - carbon dioxide 
+  int miscellaneous_gases_read = analogRead(miscellaneous_gases);
+  ThingSpeak.setField( 6, miscellaneous_gases_read);
+
+  float miscellaneous_gases_perc = (miscellaneous_gases_read/4095.0)*100.0;
+  Serial.printf("miscellaneous gases: %.2f %%\t\n", miscellaneous_gases_perc);
+}
+
+void humi_read()
+{
   // DHT11 code - temperature and humidity
   //float temp = dht.readTemperature() ;    // reads temperature in celcius 
   float humi =dht.readHumidity()  ;       // reads humidity in percentage 
@@ -75,21 +76,17 @@ void loop()
   if (isnan(humi))  
   {
     Serial.println("Humidity Data ⚠");
-    ThingSpeak.setField(2 , humi);
   }
   else 
   {
     //Serial.printf("Temperature : %5.1f °C\n", temp);
+    ThingSpeak.setField(2 , humi);
     Serial.printf("Humidity    : %5.1f %%\t\n", humi);
   }
+}
 
-  // mq135 code - carbon dioxide 
-  int mq135_read = analogRead(mq135analog);
-  ThingSpeak.setField( 6, mq135_read);
-
-  float mq135_perc = (mq135_read/4095.0)*100.0;
-  Serial.printf("CO2: %.2f %%\t\n",mq135_perc);
-
+void pm_read()
+{
   // pm code 
   digitalWrite(pm_led,LOW) ;        // when this pin is active low , led inside pm glows up
   delayMicroseconds(280) ;          // recommended 
@@ -100,10 +97,26 @@ void loop()
   digitalWrite(pm_led,HIGH);  // pm led is off now else it will be on for infinite time draining power
   delayMicroseconds(9680);    // for completing 100Hz (10msec = 280 +40+9680) cycle: LED to cool,Sensor chamber to clear,Photodiode to reset
 
-  Serial.printf("PM SENSOR  : %d\T \n" , pm_vo_read);
-  Serial.printf("ADC");
-  ThingSpeak.setField( 7 , pm_vo_read);
+  // Convert ADC to voltage (ESP32: 12-bit ADC, 3.3V reference)
+  float voltage = (pm_vo_read / 4095.0) * 3.3;
 
+  // Adjusted constants for 3.3V supply
+  float Voc = 0.6;  // Baseline voltage at 3.3V (empirically lower than 0.9V)
+  float K = 0.35;   // Sensitivity constant (lower LED current → lower slope)
+
+  // Estimate dust density (mg/m³)
+  float dustDensity = (voltage - Voc) / K;
+  if (dustDensity < 0) dustDensity = 0;
+
+  // Print evaluator-friendly output
+  Serial.printf("Dust=%.3f mg/m³\n", dustDensity);
+
+  // Upload dust density to ThingSpeak (Field 7)
+  ThingSpeak.setField(7, dustDensity);
+}
+
+void bmp180_read()
+{
   // bmp180 code 
   sensors_event_t event;            // event object is created to read pressure values 
   bmp.getEvent(&event);            // reading the value of pressure 
@@ -134,17 +147,50 @@ void loop()
   {
     Serial.println("Pressure reading falied 🔔🔔🔔");
   }
+}
 
-  // checking whether data is sent to cloud or not 
-  int status = ThingSpeak.writeFields(channel_id , write_api);
-  if (status ==200)         // 200 is HTTP code for "OK"
+void setup()
+{
+  Serial.begin(115200);
+
+  // esp32 wifi stuff
+  WiFi.begin(ssid , password);
+  Serial.println("Connecting to WiFi.");
+  while ( WiFi.status() != WL_CONNECTED)
   {
-    Serial.println("All The readings Sent to Cloud");
+    delay(500);   // practical balance between responsiveness and stability
+    Serial.println(".");
   }
-  else 
+
+  Serial.println("WiFi Connected ");
+  ThingSpeak.begin(Client);
+
+  // other stuffs
+  pinMode(mq2analog,INPUT);      // mq2 pin initiated for taking input 
+  pinMode(miscellaneous_gases , INPUT);     // MQ135 PIN IS INITIATED FOR TAKING INPUT
+  pinMode(pm_led , OUTPUT);              // led has to glow 
+  pinMode(pm_vo , INPUT);
+
+  Wire.begin(21,22);    // initialises i2c communication for SDA , SCK
+
+  // initialising bmp sensor 
+  if (!bmp.begin())
   {
-    Serial.println("Data Not Sent To Cloud ");
+    Serial.println("BMP is not working ");
+    return ;
   }
-  
-  delay(1500);
+  Serial.println("==================================");
+}
+
+void loop()
+{
+  Serial.println("\n==== Environmental Snapshot ====");
+  mq2_read();
+  miscellaneous_gases_read();
+  humi_read();
+  pm_read();
+  bmp180_read();
+  data_cloud(3);
+  delay(15000);   // minimum rate to send data to cloud 
+  //If  data sent faster than every 15 seconds, ThingSpeak will reject the request
 }
