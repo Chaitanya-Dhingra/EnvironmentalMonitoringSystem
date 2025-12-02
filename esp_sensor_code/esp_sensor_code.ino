@@ -27,14 +27,14 @@ DHT dht(DHTPIN, DHTTYPE);
 // --------------------------------------
 // WIFI
 // --------------------------------------
-const char* ssid = "2x9";
-const char* password = "geeu2025-26";
+const char* ssid = "CD OnePlus 13R";
+const char* password = "dhingra@1801";
 
 // --------------------------------------
 // FASTAPI SERVER URL
 // --------------------------------------
 // !! CHANGE THIS TO YOUR PC's IPv4 !!
-const char* serverURL = "http://10.0.3.19:8000/add-batch";
+const char* serverURL = "http://10.85.246.106:8000/add-batch";
 
 // Device ID
 String device_id = "NODE_01";
@@ -163,6 +163,7 @@ void readBMP180() {
 // ----------------------------------------------------
 void setup() {
   Serial.begin(115200);
+  dht.begin();
 
   WiFi.begin(ssid, password);
   Serial.println("Connecting to WiFi...");
@@ -213,5 +214,5 @@ void loop() {
     altitude_val
   );
 
-  delay(15000);  // 15 sec between uploads
+  delay(15 * 60 * 1000);   // 15 minutes
 }
