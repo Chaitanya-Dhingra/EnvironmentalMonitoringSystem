@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>IoT Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <h1>Environmental Monitoring Dashboard</h1>
+
+  <div style="text-align:center; margin-bottom:12px;">
+    <label for="sensorSelect">Choose sensor:</label>
+    <select id="sensorSelect"></select>
+  </div>
+
+  <div class="cards" id="cardsRow">
+      <div class="card" id="mq2_card">MQ2</div>
+      <div class="card" id="mq135_card">MQ135</div>
+      <div class="card" id="humidity_card">Humidity</div>
+      <div class="card" id="pm_card">PM Dust</div>
+      <div class="card" id="pressure_card">Pressure</div>
+      <div class="card" id="temp_card">Temperature</div>
+      <div class="card" id="altitude_card">Altitude</div>
+  </div>
+
+  <div class="chart-container">
+    <canvas id="sensorChart"></canvas>
+  </div>
+
+  <div id="summaryContainer" class="summary-cards">
+    <div class="summary-card" id="min_card">Min: —</div>
+    <div class="summary-card" id="max_card">Max: —</div>
+    <div class="summary-card" id="avg_card">Avg: —</div>
+</div>
+
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
