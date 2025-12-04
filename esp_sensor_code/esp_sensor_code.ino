@@ -131,7 +131,7 @@ float readDust() {
   float dustDensity = (voltage - Voc) / K;
   if (dustDensity < 0) dustDensity = 0;
 
-  Serial.printf("Dust Density: %.3f mg/m³\n", dustDensity);
+  Serial.printf("Dust Density: %.3f ug/m³\n", dustDensity);
 
   return dustDensity;
 }

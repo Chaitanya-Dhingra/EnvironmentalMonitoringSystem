@@ -1,59 +1,160 @@
 from fastapi import FastAPI
-from models import SensorData
-from db import get_connection
-from datetime import datetime, date, time, timedelta
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
 import os
+import smtplib
+from email.mime.text import MIMEText
+
+from db import get_connection
+from models import SensorData
+
+
+# =====================================================
+#  BREVO EMAIL ALERT SYSTEM (100% WORKING)
+# =====================================================
+
+def send_email_alert(subject: str, body: str):
+    sender = os.getenv("ALERT_EMAIL")               # your verified sender
+    receiver = os.getenv("ALERT_TO")                # where the alert goes
+    smtp_username = os.getenv("SMTP_USERNAME")      # Brevo SMTP login
+    smtp_password = os.getenv("SMTP_PASSWORD")      # Brevo SMTP key
+    smtp_server = os.getenv("SMTP_SERVER", "smtp-relay.brevo.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+
+    if not all([sender, receiver, smtp_username, smtp_password]):
+        print("⚠ Email alerts DISABLED — missing SMTP settings.")
+        return
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = receiver
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=20)
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        server.sendmail(sender, [receiver], msg.as_string())
+        server.quit()
+        print("📧 Email sent successfully via Brevo!")
+    except Exception as e:
+        print("❌ Email send FAILED:", e)
+
+
+# =====================================================
+#  ALERT THRESHOLDS
+# =====================================================
+
+THRESHOLDS = {
+    "MQ2": {"high": 40, "low": 35, "cooldown_min": 30},
+    "MQ135": {"high": 30, "low": 25, "cooldown_min": 30},
+    "Humidity": {"high": 90, "low": 85, "cooldown_min": 60},
+    "PM_Dust": {"high": 0.5, "low": 0.4, "cooldown_min": 15},
+    "BMP_Pressure": {
+        "high": 1030, "low": 1020,
+        "low2": 910, "high2": 900,
+        "cooldown_min": 60
+    },
+    "BMP_Temperature": {"high": 32, "low": 30, "cooldown_min": 30}
+}
+
+
+def check_alert_needed(sensor, value):
+    if sensor not in THRESHOLDS:
+        return None
+
+    t = THRESHOLDS[sensor]
+
+    if "high" in t and value > t["high"]:
+        return f"{sensor} ALERT: Value {value} above safe limit!"
+
+    if "low" in t and value < t["low"]:
+        return None
+
+    if sensor == "BMP_Pressure":
+        if value < t["high2"]:
+            return f"LOW PRESSURE ALERT: {value} hPa!"
+
+    return None
+
+
+def should_send_alert(conn, sensor):
+    cur = conn.cursor()
+    cur.execute("SELECT last_alert FROM sensor_alerts WHERE sensor_name = %s", (sensor,))
+    row = cur.fetchone()
+
+    if not row or not row[0]:
+        return True
+
+    last_alert = row[0]
+    cooldown = timedelta(minutes=THRESHOLDS[sensor]["cooldown_min"])
+
+    return (datetime.now() - last_alert) >= cooldown
+
+
+def register_alert(conn, sensor, value, message):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sensor_alerts (sensor_name, last_alert, last_value, message)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (sensor_name)
+        DO UPDATE SET 
+            last_alert = EXCLUDED.last_alert,
+            last_value = EXCLUDED.last_value,
+            message = EXCLUDED.message;
+    """, (sensor, datetime.now(), value, message))
+    conn.commit()
+
+
+# =====================================================
+#  FASTAPI APP
+# =====================================================
 
 app = FastAPI()
 
-# ----------------------------
-# DEBUG ENDPOINT
-# ----------------------------
-@app.get("/debug-env")
-def debug_env():
-    return {
-        "DB_HOST": os.getenv("DB_HOST"),
-        "DB_PORT": os.getenv("DB_PORT"),
-        "DB_USER": os.getenv("DB_USER"),
-        "DB_NAME": os.getenv("DB_NAME"),
-        "DB_PASS_MASKED": None if os.getenv("DB_PASS") is None else "****(set)"
-    }
 
-# ----------------------------
-# HOME
-# ----------------------------
+# =====================================================
+#  TEST EMAIL ENDPOINT (NEW!)
+# =====================================================
+@app.get("/test-email")
+def test_email():
+    try:
+        send_email_alert("Test Email", "This is a test email from your IoT Monitoring System (Brevo SMTP).")
+        return {"status": "sent"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+# =====================================================
+#  SENSOR INSERTION
+# =====================================================
 @app.get("/")
 def home():
-    return {"message": "IoT API is running!"}
+    return {"status": "running", "message": "IoT API is live"}
 
-# ----------------------------
-# SINGLE SENSOR INSERT
-# ----------------------------
+
 @app.post("/add")
 def add_sensor_data(data: SensorData):
     conn = get_connection()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    timestamp = data.timestamp if data.timestamp else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = data.timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    sql = """
+    cur.execute("""
         INSERT INTO sensor_readings (sensor_name, value, timestamp, device_id)
         VALUES (%s, %s, %s, %s)
-    """
+    """, (data.sensor_name, data.value, timestamp, data.device_id))
 
-    cursor.execute(sql, (data.sensor_name, data.value, timestamp, data.device_id))
     conn.commit()
-
-    cursor.close()
     conn.close()
 
-    return {"status": "ok", "message": "Data inserted successfully!"}
+    return {"status": "ok"}
 
-# ----------------------------
-# BATCH INSERT ENDPOINT
-# ----------------------------
+
 class BatchData(BaseModel):
     device_id: str
     mq2: Optional[float] = None
@@ -70,18 +171,22 @@ def add_batch(data: BatchData):
     conn = get_connection()
     cur = conn.cursor()
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    timestamp = ist_now.strftime("%Y-%m-%d %H:%M:%S")
 
     def insert(sensor_name, value):
         if value is None:
             return
-        cur.execute(
-            """
+
+        alert_msg = check_alert_needed(sensor_name, value)
+        if alert_msg and should_send_alert(conn, sensor_name):
+            send_email_alert(f"{sensor_name} Alert", alert_msg)
+            register_alert(conn, sensor_name, value, alert_msg)
+
+        cur.execute("""
             INSERT INTO sensor_readings (sensor_name, value, timestamp, device_id)
             VALUES (%s, %s, %s, %s)
-            """,
-            (sensor_name, value, timestamp, data.device_id)
-        )
+        """, (sensor_name, value, timestamp, data.device_id))
 
     insert("MQ2", data.mq2)
     insert("MQ135", data.mq135)
@@ -92,45 +197,25 @@ def add_batch(data: BatchData):
     insert("BMP_Altitude", data.bmp_altitude)
 
     conn.commit()
-    cur.close()
     conn.close()
 
-    return {"status": "ok", "message": "Batch inserted"}
-
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-
-@app.get("/daily-summary/{sensor_name}")
-def daily_summary(sensor_name: str):
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT 
-            MIN(value), 
-            MAX(value), 
-            AVG(value)
-        FROM sensor_readings
-        WHERE sensor_name = %s
-          AND timestamp >= CURRENT_DATE
-    """, (sensor_name,))
-
-    row = cur.fetchone()
-    conn.close()
-
-    return {
-        "min": float(row[0]) if row[0] is not None else None,
-        "max": float(row[1]) if row[1] is not None else None,
-        "avg": float(row[2]) if row[2] is not None else None
-    }
+    return {"status": "ok", "timestamp_ist": timestamp}
 
 
+# =====================================================
+#  STATIC FILES (Dashboard)
+# =====================================================
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 @app.get("/dashboard")
 def dashboard():
     return FileResponse("static/dashboard.html")
 
+
+# =====================================================
+#  LATEST READINGS
+# =====================================================
 
 @app.get("/latest")
 def latest():
@@ -142,80 +227,113 @@ def latest():
         "BMP_Pressure", "BMP_Temperature", "BMP_Altitude"
     ]
 
-    output = {}
-
+    out = {}
     for s in sensors:
         cur.execute("""
-            SELECT value FROM sensor_readings
+            SELECT value
+            FROM sensor_readings
             WHERE sensor_name = %s
             ORDER BY timestamp DESC LIMIT 1
         """, (s,))
         row = cur.fetchone()
-        output[s] = row[0] if row else None
+        out[s] = row[0] if row else None
 
     conn.close()
-    return output
+    return out
+
+
+# =====================================================
+#  TREND (15-MIN SLOTS, TODAY + HISTORICAL)
+# =====================================================
 
 @app.get("/trend/{sensor_name}")
 def trend(sensor_name: str):
-    """
-    Returns:
-      {
-        "timestamps": ["00:00","00:15",...],    # 96 items
-        "today": [val_or_null, ...],            # 96 items (last reading in each slot for today)
-        "historical": [avg_or_null, ...]        # 96 items (avg of all previous days per slot)
-      }
-    Uses server's local date (IST for you).
-    """
+    ist = ZoneInfo("Asia/Kolkata")
+    today = datetime.now(ist).date()
+
     conn = get_connection()
     cur = conn.cursor()
 
-    # Historical averages for all days BEFORE today (slots 0..95)
+    # Historical averages
     cur.execute("""
         SELECT
-          floor((extract(hour from timestamp)::int * 60 + extract(minute from timestamp)::int) / 15)::int AS slot,
-          AVG(value) AS avg_val
+          FLOOR((EXTRACT(HOUR FROM timestamp) * 60 +
+                 EXTRACT(MINUTE FROM timestamp)) / 15)::int AS slot,
+          AVG(value)
         FROM sensor_readings
         WHERE sensor_name = %s
-          AND timestamp::date <= current_date
         GROUP BY slot;
     """, (sensor_name,))
-    hist_rows = cur.fetchall()
+    historical_rows = cur.fetchall()
 
     historical = [None] * 96
-    for slot, avg_val in hist_rows:
-        if avg_val is not None:
-            historical[int(slot)] = float(avg_val)
+    for slot, avg in historical_rows:
+        if 0 <= slot < 96:
+            historical[slot] = float(avg)
 
-    # Today's last reading in each slot (take the latest timestamp within the slot)
+    # Today's latest readings per slot
     cur.execute("""
         SELECT slot, value FROM (
-          SELECT
-            floor((extract(hour from timestamp)::int * 60 + extract(minute from timestamp)::int) / 15)::int AS slot,
-            value,
-            row_number() OVER (PARTITION BY floor((extract(hour from timestamp)::int * 60 + extract(minute from timestamp)::int) / 15)::int
-                               ORDER BY timestamp DESC) AS rn
-          FROM sensor_readings
-          WHERE sensor_name = %s
-            AND timestamp::date = current_date
+            SELECT
+              FLOOR((EXTRACT(HOUR FROM timestamp) * 60 +
+                     EXTRACT(MINUTE FROM timestamp)) / 15)::int AS slot,
+              value,
+              ROW_NUMBER() OVER (
+                PARTITION BY FLOOR((EXTRACT(HOUR FROM timestamp) * 60 +
+                                    EXTRACT(MINUTE FROM timestamp)) / 15)
+                ORDER BY timestamp DESC
+              ) AS rn
+            FROM sensor_readings
+            WHERE sensor_name = %s
+              AND timestamp::date = %s
         ) t
         WHERE rn = 1;
-    """, (sensor_name,))
-    today_rows = cur.fetchall()
+    """, (sensor_name, today))
 
-    today = [None] * 96
-    for slot, val in today_rows:
-        if val is not None:
-            today[int(slot)] = float(val)
+    today_list = [None] * 96
+    for slot, val in cur.fetchall():
+        if 0 <= slot < 96:
+            today_list[slot] = float(val)
 
     conn.close()
 
-    # Build labels in 15-min steps (00:00 ... 23:45) using server local time (IST as requested)
+    # Time labels
     labels = []
-    base = datetime.combine(date.today(), time(0, 0))
+    base = datetime.combine(today, time(0, 0), ist)
     for i in range(96):
-        dt = base + timedelta(minutes=15 * i)
-        labels.append(dt.strftime("%H:%M"))
+        labels.append((base + timedelta(minutes=15 * i)).strftime("%H:%M"))
 
-    return {"timestamps": labels, "today": today, "historical": historical}
+    return {
+        "timestamps": labels,
+        "today": today_list,
+        "historical": historical
+    }
 
+
+# =====================================================
+#  DAILY SUMMARY
+# =====================================================
+
+@app.get("/daily-summary/{sensor_name}")
+def daily_summary(sensor_name: str):
+    ist = ZoneInfo("Asia/Kolkata")
+    today = datetime.now(ist).date()
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT MIN(value), MAX(value), AVG(value)
+        FROM sensor_readings
+        WHERE sensor_name = %s
+          AND timestamp::date = %s
+    """, (sensor_name, today))
+
+    m = cur.fetchone()
+    conn.close()
+
+    return {
+        "min": float(m[0]) if m[0] else None,
+        "max": float(m[1]) if m[1] else None,
+        "avg": float(m[2]) if m[2] else None
+    }

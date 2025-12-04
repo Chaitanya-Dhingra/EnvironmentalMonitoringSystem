@@ -3,3 +3,5 @@ uvicorn
 mysql-connector-python
 python-dotenv
 pydantic
+fastapi-utils
+typing-inspect
